@@ -43,6 +43,17 @@ def serialize_int8(file, tensor):
     b = struct.pack(f'{len(d)}b', *d)
     file.write(b)
 
+def serialize_blockQ8_0(file, scale, tensor, block_sz=32):
+    """ writes BlockQ8_0 tensor to file that is open in wb mode """
+    assert len(scale) == tensor.shape[0]
+    assert tensor.shape[1] == block_sz
+    qs = tensor.detach().cpu().numpy().astype(np.int8)
+    ss = scale.detach().cpu().half().numpy().astype(np.float16)
+    for s, q in zip(ss, qs):
+        b_scale = struct.pack('e', s)
+        b_tensor = struct.pack(f'{len(q)}b', *q)
+        file.write(b_scale + b_tensor)
+
 def quantize_q80(w, group_size):
     """
     takes a tensor and returns the Q8_0 quantized version
@@ -265,6 +276,87 @@ def version2_export(model, filepath, group_size=64):
     out_file.close()
     print(f"wrote {filepath}")
 
+# -----------------------------------------------------------------------------
+# Version 3 to quantize and export into BlockQ8_0, to use in Rust QTensor
+
+def version3_export(model, filepath):
+    """
+    Export the model weights in BlockQ8_0 into .bin file to be read from Rust (into candle QTensor).
+    That is:
+    - quantize all weights to symmetric int8, in range [-127, 127]
+    - all other tensors (the rmsnorm params) are kept and exported in fp32
+    - quantization is done in groups of group_size to reduce the effects of any outliers
+    - group_size=32 hardcoded (it is BlockQ8_0 block size)
+    """
+    version = 3
+    group_size=32
+
+    # let's first do some validation for this export type
+    assert model.params.dim % group_size == 0
+
+    weights = [
+        model.tok_embeddings.weight,
+        *[layer.attention.wq.weight for layer in model.layers],
+        *[layer.attention.wk.weight for layer in model.layers],
+        *[layer.attention.wv.weight for layer in model.layers],
+        *[layer.attention.wo.weight for layer in model.layers],
+        *[layer.feed_forward.w1.weight for layer in model.layers],
+        *[layer.feed_forward.w2.weight for layer in model.layers],
+        *[layer.feed_forward.w3.weight for layer in model.layers],
+    ]
+    shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
+    if not shared_classifier:
+        weights.append(model.output.weight)
+    for i, w in enumerate(weights):
+        assert w.numel() % group_size == 0, f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"
+
+    # write
+    out_file = open(filepath, 'wb')
+    # first write out the header. the header will be 256 bytes
+    # 1) write magic, which will be uint32 of "ak42" in ASCII
+    out_file.write(struct.pack('I', 0x616b3432))
+    # 2) write version, which will be int
+    out_file.write(struct.pack('i', version))
+    # 3) write the params, which will be 7 ints
+    p = model.params
+    hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
+    n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
+    header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                                    n_kv_heads, p.vocab_size, p.max_seq_len)
+    out_file.write(header)
+    # 4) write some other flags
+    out_file.write(struct.pack('B', int(shared_classifier)))
+    pad = 256 - out_file.tell() # pad rest with zeros; tell returns current pos
+    assert pad >= 0
+    out_file.write(b'\0' * pad)
+    # now that the header is done, let's write out the model
+
+    # first let's write out all the params that we are keeping in fp32: the norms
+    for layer in model.layers: # attention norms
+        serialize_fp32(out_file, layer.attention_norm.weight)
+    for layer in model.layers: # MLP norms
+        serialize_fp32(out_file, layer.ffn_norm.weight)
+    serialize_fp32(out_file, model.norm.weight) # final pre-classifier norm
+
+    # now let's write out all the params that we are quantizing to BlockQ8_0
+    ew = []
+    for i, w in enumerate(weights):
+        # quantize this weight
+        q, s, err = quantize_q80(w, group_size)
+        # save the int8 weights to file
+        serialize_blockQ8_0(out_file, s, q, group_size) # save the tensor in BlockQ8_0
+        # logging
+        ew.append((err, w.shape))
+        print(f"{i+1}/{len(weights)} quantized {tuple(w.shape)} to BlockQ8_0 with max error {err}")
+
+    # print the highest error across all weights, should be very small, e.g. O(~0.001)
+    ew.sort(reverse=True)
+    print(f"max quantization group error across all weights: {ew[0][0]}")
+
+    # write to binary file
+    out_file.close()
+    print(f"wrote {filepath}")
+
 
 # -----------------------------------------------------------------------------
 # Load / import functions
@@ -412,6 +504,8 @@ def model_export(model, filepath, version):
         version1_export(model, filepath)
     elif version == 2:
         version2_export(model, filepath)
+    elif version == 3:
+        version3_export(model, filepath)
     else:
         raise ValueError(f"unknown version {version}")
 
