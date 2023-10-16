@@ -335,6 +335,7 @@ If your candidate PRs have elements of these it doesn't mean they won't get merg
 ## notable forks
 
 - Rust
+  - [llama2-rs](https://github.com/ademyanchuk/llama2-rs) by @[ademyanchuk](https://github.com/ademyanchuk): yet another Rust implementation featuring quantized weights and chat, utilizing Rust [candle](https://github.com/huggingface/candle) library
   - [llama2.rs](https://github.com/gaxler/llama2.rs) by @[gaxler](https://github.com/gaxler): a Rust port of this project
   - [llama2.rs](https://github.com/leo-du/llama2.rs) by @[leo-du](https://github.com/leo-du): A Rust port of this project
   - [llama2-rs](https://github.com/danielgrittner/llama2-rs) by @[danielgrittner](https://github.com/danielgrittner): a Rust port of this project
